@@ -909,6 +909,102 @@ test("compatible provider names JEV_API_BASE_URL alone when only it is missing",
     (port) => compatibleEnv(port, { JEV_API_BASE_URL: "" }),
   );
 });
+const opencodeEnv = (port, overrides = {}) => ({
+  JEV_PROVIDER: "opencode",
+  OPENCODE_API_KEY: "oc-test-key",
+  // Trailing slash on purpose: the configured root must join to a
+  // single-slash /systemone request path.
+  JEV_OPENCODE_BASE_URL: `http://127.0.0.1:${port}/zen/v1/`,
+  ...overrides,
+});
+
+const verifySupports = (request) => ({
+  relation_claim0: pick("supports", Object.keys(request.questions.relation_claim0.criteria)),
+});
+
+test("opencode provider posts to /systemone and maps jev-latest to the current release", async () => {
+  await withMock(verifySupports, async (client, requests) => {
+    const body = payload(await client.callTool({ name: "jev_verify", arguments: VERIFY_ARGS }));
+    assert.equal(body.provider, "opencode");
+    assert.equal(body.results[0].verdict, "verified");
+    assert.equal(body.model, "jev-1.13");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, "POST");
+    assert.equal(requests[0].path, "/zen/v1/systemone");
+    assert.equal(requests[0].headers.authorization, "Bearer oc-test-key");
+    assert.equal(requests[0].body.model, "jev-1.13");
+  }, opencodeEnv);
+});
+
+test("opencode provider sends a pinned free model bare and reports the echoed model", async () => {
+  // OpenCode configs spell models opencode/<id>; the endpoint takes the bare id.
+  await withMock(verifySupports, async (client, requests) => {
+    const body = payload(await client.callTool({ name: "jev_verify", arguments: VERIFY_ARGS }));
+    assert.equal(requests[0].body.model, "jev-1.13-free");
+    assert.equal(body.model, "jev-1.13-free");
+    assert.deepEqual(body.usage, { input_tokens: 280, output_tokens: 20 });
+  }, (port) => opencodeEnv(port, { JEV_MCP_MODEL: "opencode/jev-1.13-free" }),
+  { model: "jev-1.13-free", usage: { input_tokens: 280, output_tokens: 20 } });
+});
+
+test("opencode provider auto-selects when OPENCODE_API_KEY is the only credential", async () => {
+  await withMock(verifySupports, async (client, requests) => {
+    const body = payload(await client.callTool({ name: "jev_verify", arguments: VERIFY_ARGS }));
+    assert.equal(body.provider, "opencode");
+    assert.equal(requests[0].path, "/zen/v1/systemone");
+  }, (port) => opencodeEnv(port, { JEV_PROVIDER: "", TYPESAFE_API_KEY: "", TYPESAFE_BASE_URL: "" }));
+});
+
+test("an OPENCODE_API_KEY never displaces a built-in provider under auto-detection", async () => {
+  // withMock configures TYPESAFE_API_KEY against the same mock; direct
+  // TypeSafe keeps precedence, and the /systemone path is never hit.
+  await withMock(verifySupports, async (client, requests) => {
+    const body = payload(await client.callTool({ name: "jev_verify", arguments: VERIFY_ARGS }));
+    assert.equal(body.provider, "typesafe");
+    assert.ok(requests.every((r) => r.path !== "/zen/v1/systemone"));
+  }, (port) => opencodeEnv(port, { JEV_PROVIDER: "auto" }));
+});
+
+test("a configured compatible endpoint outranks an OPENCODE_API_KEY under auto-detection", async () => {
+  await withMock(verifySupports, async (client, requests) => {
+    const body = payload(await client.callTool({ name: "jev_verify", arguments: VERIFY_ARGS }));
+    assert.equal(body.provider, "compatible");
+    assert.equal(requests[0].path, "/v1/systemone");
+  }, (port) => ({ ...compatibleEnv(port), ...opencodeEnv(port), JEV_PROVIDER: "", TYPESAFE_API_KEY: "" }));
+});
+
+test("opencode provider without OPENCODE_API_KEY is a configuration error", async () => {
+  await withMock({}, async (client, requests) => {
+    const result = await client.callTool({ name: "jev_verify", arguments: VERIFY_ARGS });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /JEV_PROVIDER=opencode but OPENCODE_API_KEY is not set/);
+    assert.equal(requests.length, 0);
+  }, (port) => opencodeEnv(port, { OPENCODE_API_KEY: "" }));
+});
+
+test("opencode provider reports non-2xx status without upstream body text", async () => {
+  // OpenCode answers an unsupported model with a 401; the body must not reach
+  // the MCP-visible error, and a processed rejection is never re-sent.
+  await withMock({}, async (client, requests) => {
+    const result = await client.callTool({ name: "jev_verify", arguments: VERIFY_ARGS });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /OpenCode Zen systemone API 401/);
+    assert.ok(!result.content[0].text.includes("oc-test-key"));
+    assert.ok(!result.content[0].text.includes("ModelError"));
+    assert.equal(requests.length, 1);
+  }, opencodeEnv,
+  { status: 401, raw: JSON.stringify({ type: "error", error: { type: "ModelError", message: "Bearer oc-test-key" } }) });
+});
+
+test("opencode provider rejects a malformed envelope and retries a retryable 5xx", async () => {
+  await withMock(null, async (client, requests) => {
+    const result = await client.callTool({ name: "jev_verify", arguments: VERIFY_ARGS });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /OpenCode Zen systemone API returned an invalid response/);
+    assert.equal(requests.length, 2);
+  }, opencodeEnv, { status: (count) => (count === 1 ? 503 : 200) });
+});
+
 function assertWireResult(result, expected) {
   const block = result.content.find((b) => b.type === "text");
   assert.equal(block.text, JSON.stringify(expected, null, 2));

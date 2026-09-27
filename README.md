@@ -670,7 +670,7 @@ Built-in provider selection runs through the shared [@jkudish/jev-agent-tools](h
 - **Cloudflare Workers AI** (`CLOUDFLARE_API_TOKEN` or `JEV_CLOUDFLARE_API_TOKEN`, plus `CLOUDFLARE_ACCOUNT_ID`).
 - **Vercel AI Gateway** (`AI_GATEWAY_API_KEY`).
 
-`JEV_PROVIDER` forces one, or `compatible` for any System One-compatible endpoint. Unknown names and missing credentials are configuration errors, never silent fallbacks. For resilience reasons the OpenRouter, Cloudflare, and compatible transports are implemented locally; see [Transport resilience](#transport-resilience).
+`JEV_PROVIDER` forces one, `opencode` for [OpenCode Zen](#opencode-zen), or `compatible` for any System One-compatible endpoint. Unknown names and missing credentials are configuration errors, never silent fallbacks. For resilience reasons the OpenRouter, Cloudflare, OpenCode Zen, and compatible transports are implemented locally; see [Transport resilience](#transport-resilience).
 
 The built-ins stay limited to major providers. The no-code extension path here is the [compatible endpoint](#jev-compatible-endpoints); the [add-a-provider guide](https://github.com/jkudish/jev-agent-tools#adding-a-provider) in the shared package covers transport injection and third-party driver packages. Published driver packages get linked here on request.
 
@@ -680,7 +680,8 @@ The built-ins stay limited to major providers. The no-code extension path here i
 | `OPENROUTER_API_KEY` | none | OpenRouter `sk-or-` key; used when `TYPESAFE_API_KEY` is absent. |
 | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | none | Cloudflare Workers AI; used when no other provider key is present. `JEV_CLOUDFLARE_API_TOKEN` is honored first for separate credentials. |
 | `AI_GATEWAY_API_KEY` | none | Vercel AI Gateway; used when no other provider key is present. |
-| `JEV_PROVIDER` | `auto` | Force `typesafe`, `openrouter`, `cloudflare`, `vercel`, or `compatible` instead of auto-detection. |
+| `OPENCODE_API_KEY` | none | OpenCode Zen; used when no built-in provider key and no compatible endpoint is configured. |
+| `JEV_PROVIDER` | `auto` | Force `typesafe`, `openrouter`, `cloudflare`, `vercel`, `opencode`, or `compatible` instead of auto-detection. |
 | `JEV_MCP_MODEL` | `jev-latest` | Pin a Jev version, e.g. `jev-1.12`, or `typesafe/jev-1.13` on OpenRouter. |
 | `TYPESAFE_BASE_URL` | none | Custom direct endpoint (origin only; the SDK appends its route). |
 | `JEV_API_BASE_URL` + `JEV_API_KEY` | none | Jev-compatible System One endpoint and Bearer token; use with `JEV_PROVIDER=compatible`. `JEV_API_BASE_URL` is the full POST URL including the `/v1/systemone` path. |
@@ -688,10 +689,11 @@ The built-ins stay limited to major providers. The no-code extension path here i
 | `JEV_MCP_MAX_ATTEMPTS` | `3` | Total attempts per request (clamped 1..6) on the fetch-based transports; retries happen only on 408, 409, 429, and 500 through 599. |
 | `JEV_OPENROUTER_BASE_URL` | `https://openrouter.ai/api` | Override the OpenRouter API root (the `/alpha/decisions` path is appended; a trailing slash is tolerated). |
 | `JEV_CLOUDFLARE_BASE_URL` | `https://api.cloudflare.com/client/v4` | Override the Cloudflare API root (`/accounts/<id>/ai/run` is appended; a trailing slash is tolerated). |
+| `JEV_OPENCODE_BASE_URL` | `https://opencode.ai/zen/v1` | Override the OpenCode Zen API root (`/systemone` is appended; a trailing slash is tolerated). |
 
 ### Transport resilience
 
-The fetch-based transports (OpenRouter, Cloudflare, and the Jev-compatible endpoint) retry only on the standard not-processed status set (408, 409, 429, and 500 through 599), with jittered exponential backoff, at most `JEV_MCP_MAX_ATTEMPTS` total attempts, all inside one `JEV_MCP_REQUEST_TIMEOUT_MS` deadline. A status cannot prove the request was not processed, but that allowlist is the conservative retry trigger; ambiguous network-level failures (connection reset, TLS errors) are never retried, because without an idempotency key a re-send can double-process a paid call. Everything else fails immediately: caller cancellations, deadline expiry, non-retryable statuses, unparseable bodies, and responses over 1,000,000 bytes, a ceiling enforced while the body streams rather than after buffering. A cancelled MCP call aborts the in-flight HTTP request, cuts any backoff sleep short, and is never re-sent. Error bodies on those transports are redacted, so a reflecting endpoint can never echo a configured key into MCP-visible errors. Direct TypeSafe and Vercel calls use `@jkudish/jev-agent-tools`, whose direct fetch path avoids the SDK cancellation crash ([typesafe-sdk-js#2](https://github.com/typesafe-ai/typesafe-sdk-js/issues/2)); no retry or deadline uniformity is claimed for those two. Research and the original report: [issue #23](https://github.com/jkudish/jev-mcp/issues/23) by oppih.
+The fetch-based transports (OpenRouter, Cloudflare, OpenCode Zen, and the Jev-compatible endpoint) retry only on the standard not-processed status set (408, 409, 429, and 500 through 599), with jittered exponential backoff, at most `JEV_MCP_MAX_ATTEMPTS` total attempts, all inside one `JEV_MCP_REQUEST_TIMEOUT_MS` deadline. A status cannot prove the request was not processed, but that allowlist is the conservative retry trigger; ambiguous network-level failures (connection reset, TLS errors) are never retried, because without an idempotency key a re-send can double-process a paid call. Everything else fails immediately: caller cancellations, deadline expiry, non-retryable statuses, unparseable bodies, and responses over 1,000,000 bytes, a ceiling enforced while the body streams rather than after buffering. A cancelled MCP call aborts the in-flight HTTP request, cuts any backoff sleep short, and is never re-sent. Error bodies on those transports are redacted, so a reflecting endpoint can never echo a configured key into MCP-visible errors. Direct TypeSafe and Vercel calls use `@jkudish/jev-agent-tools`, whose direct fetch path avoids the SDK cancellation crash ([typesafe-sdk-js#2](https://github.com/typesafe-ai/typesafe-sdk-js/issues/2)); no retry or deadline uniformity is claimed for those two. Research and the original report: [issue #23](https://github.com/jkudish/jev-mcp/issues/23) by oppih.
 
 ### Vercel
 
@@ -704,6 +706,18 @@ With `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` set (and no other provid
 ### OpenRouter
 
 If you already have an OpenRouter key, that is all you need: with no `TYPESAFE_API_KEY` present, every call goes through OpenRouter's Decisions API at identical pricing. The endpoint is alpha and adds a hop, and OpenRouter serves pinned versions rather than a `latest` alias, so the default `jev-latest` maps to `typesafe/jev-1.13` there. Direct TypeSafe remains the recommended default when you have both keys.
+
+### OpenCode Zen
+
+With an [OpenCode Zen](https://opencode.ai/docs/zen/) key, judgments run through its System One endpoint at `https://opencode.ai/zen/v1/systemone`:
+
+```bash
+export JEV_PROVIDER=opencode
+export OPENCODE_API_KEY=your-opencode-zen-key
+export JEV_MCP_MODEL=jev-1.13-free
+```
+
+`JEV_PROVIDER` can be left unset when `OPENCODE_API_KEY` is the only provider credential present; any built-in provider key or a configured compatible endpoint takes precedence. Zen serves pinned versions (`jev-1.13`) and a limited-time free variant (`jev-1.13-free`) but no `latest` alias, so the default `jev-latest` maps to the paid `jev-1.13`; pin `jev-1.13-free` explicitly while it is offered. The `opencode/` prefix used in OpenCode configs is accepted and stripped. Usage tokens come back on every call. The endpoint adds a hop, so direct TypeSafe remains the recommended default when you have both keys.
 
 ### Jev-compatible endpoints
 

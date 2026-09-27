@@ -1,12 +1,13 @@
 // Jev transport: TypeSafe direct (default), OpenRouter Decisions, Cloudflare
-// Workers AI, or a caller-supplied Jev-compatible System One endpoint. All
-// speak the {state, questions} / answers contract; URL, auth, and model slugs
-// differ. Proxies add hops, so direct TypeSafe remains the recommended default.
+// Workers AI, OpenCode Zen, or a caller-supplied Jev-compatible System One
+// endpoint. All speak the {state, questions} / answers contract; URL, auth,
+// and model slugs differ. Proxies add hops, so direct TypeSafe remains the
+// recommended default.
 
 import { ask, resolveTransport, type JevTransport, type JevTransportReply } from "@jkudish/jev-agent-tools";
 import { isRecord } from "./lib.js";
 
-export type JevProvider = "typesafe" | "openrouter" | "cloudflare" | "vercel" | "compatible";
+export type JevProvider = "typesafe" | "openrouter" | "cloudflare" | "vercel" | "opencode" | "compatible";
 
 export interface AskResult {
   answers: Record<string, any>;
@@ -27,9 +28,9 @@ function redactSecret(text: string, secret: string): string {
 
 // ── Transport resilience ─────────────────────────────────────────────────────
 // Research and the original report: GitHub issue #23 by oppih. Applies to the
-// fetch-based transports (openrouter, cloudflare, compatible); the typesafe
-// and vercel branches go through SDK-owned transports whose retry and timeout
-// semantics are theirs, so no uniformity is claimed for those.
+// fetch-based transports (openrouter, cloudflare, opencode, compatible); the
+// typesafe and vercel branches go through SDK-owned transports whose retry and
+// timeout semantics are theirs, so no uniformity is claimed for those.
 
 const positiveIntFromEnv = (name: string, fallback: number): number => {
   const raw = Number(process.env[name]);
@@ -215,9 +216,26 @@ async function fetchWithResilience(url: string, init: RequestInit, deadline: Dea
   }
 }
 
+/** The four credential rules the shared package auto-detects, mirrored so local providers only fill the gap. */
+function hasBuiltinCredential(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env.TYPESAFE_API_KEY) || /^sk-or-/.test(env.OPENROUTER_API_KEY ?? "") ||
+    Boolean((env.JEV_CLOUDFLARE_API_TOKEN || env.CLOUDFLARE_API_TOKEN) && env.CLOUDFLARE_ACCOUNT_ID) ||
+    Boolean(env.AI_GATEWAY_API_KEY);
+}
+
 function resolve(env: NodeJS.ProcessEnv): JevProvider {
   const explicit = (env.JEV_PROVIDER ?? "auto").toLowerCase();
+  const auto = explicit === "auto" || explicit === "";
   const hasCompatible = Boolean(env.JEV_API_KEY && env.JEV_API_BASE_URL);
+  if (explicit === "opencode") {
+    if (!env.OPENCODE_API_KEY) {
+      throw new Error(
+        "JEV_PROVIDER=opencode but OPENCODE_API_KEY is not set. " +
+          "JEV_MCP_MODEL is optional and defaults to jev-latest, which maps to jev-1.13.",
+      );
+    }
+    return "opencode";
+  }
   if (explicit === "compatible") {
     const missing = ["JEV_API_KEY", "JEV_API_BASE_URL"].filter((name) => !env[name]);
     if (missing.length > 0) {
@@ -228,12 +246,94 @@ function resolve(env: NodeJS.ProcessEnv): JevProvider {
     }
     return "compatible";
   }
-  // The published package owns the four built-in credential rules and order.
-  if ((explicit === "auto" || explicit === "") && hasCompatible &&
-      !env.TYPESAFE_API_KEY && !/^sk-or-/.test(env.OPENROUTER_API_KEY ?? "") &&
-      !((env.JEV_CLOUDFLARE_API_TOKEN || env.CLOUDFLARE_API_TOKEN) && env.CLOUDFLARE_ACCOUNT_ID) &&
-      !env.AI_GATEWAY_API_KEY) return "compatible";
+  // The published package owns the four built-in credential rules and order;
+  // local providers auto-select only when none of those is configured, and an
+  // explicitly configured compatible endpoint outranks an OpenCode key.
+  if (auto && !hasBuiltinCredential(env)) {
+    if (hasCompatible) return "compatible";
+    if (env.OPENCODE_API_KEY) return "opencode";
+  }
   return resolveTransport({ ...env, JEV_PROVIDER: explicit || "auto" }).name as JevProvider;
+}
+
+/**
+ * OpenCode Zen serves pinned versions and a limited-time free variant but no
+ * "latest" alias; map it to the current paid release so the default does not
+ * vanish when the free period ends. Pin `jev-1.13-free` with the model env var.
+ * The `opencode/` prefix OpenCode configs use and OpenRouter's `typesafe/`
+ * prefix are both stripped: the endpoint takes the bare model id.
+ */
+const OPENCODE_LATEST = "jev-1.13";
+function opencodeModel(model: string): string {
+  const bare = model.replace(/^(opencode|typesafe)\//, "");
+  return bare === "jev-latest" ? OPENCODE_LATEST : bare;
+}
+
+/**
+ * POST the standard System One request and validate the response envelope.
+ * Shared by the compatible and OpenCode transports, which differ only in URL,
+ * credential, model slug, and the fixed label used in client-visible errors.
+ */
+async function askSystemOne(
+  url: string,
+  apiKey: string,
+  label: string,
+  provider: JevProvider,
+  model: string,
+  state: unknown,
+  questions: Record<string, unknown>,
+  signal: AbortSignal | undefined,
+): Promise<AskResult> {
+  const deadline = deadlineSignal(signal, REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetchWithResilience(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model, state, questions }),
+    }, deadline);
+    const bodyText = await readBodyBounded(response, deadline);
+    if (!response.ok) {
+      // Client-visible errors stay fixed-string: provider name and numeric
+      // status only — a reflecting proxy can echo nothing back through them.
+      throw new Error(`${label} ${response.status}`);
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(bodyText);
+    } catch {
+      body = null; // parse failures never retry; surface as invalid response
+    }
+    const invalid = (why: string) => new Error(`${label} returned an invalid response: ${why}`);
+    if (!isRecord(body)) throw invalid("expected a JSON object.");
+    if (!isRecord(body.answers)) throw invalid("expected an answers object.");
+    // Envelope shape is validated here; per-question answer validity is the
+    // tools' job. Each tool fails closed under its invalid_response contract,
+    // so a missing or malformed answer can never reach tool-level defaults.
+    let inputTokens = 0;
+    let outputTokens = 0;
+    if (body.usage !== undefined && body.usage !== null) {
+      const tokenCount = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
+      if (!isRecord(body.usage) || !tokenCount(body.usage.input_tokens) || !tokenCount(body.usage.output_tokens)) {
+        throw invalid("usage must report finite non-negative input_tokens and output_tokens.");
+      }
+      inputTokens = body.usage.input_tokens;
+      outputTokens = body.usage.output_tokens;
+    }
+    if (body.model !== undefined && body.model !== null && typeof body.model !== "string") {
+      throw invalid("model must be absent or a string.");
+    }
+    return {
+      answers: body.answers,
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      provider,
+      model: typeof body.model === "string" ? body.model : model,
+    };
+  } finally {
+    deadline.dispose();
+  }
 }
 
 export async function askJev(
@@ -335,57 +435,15 @@ export async function askJev(
     }
   }
 
+  if (provider === "opencode") {
+    const url = apiUrl(process.env.JEV_OPENCODE_BASE_URL || "https://opencode.ai/zen/v1", "/systemone");
+    return askSystemOne(url, process.env.OPENCODE_API_KEY!, "OpenCode Zen systemone API", provider,
+      opencodeModel(model), state, questions, signal);
+  }
+
   if (provider === "compatible") {
-    const deadline = deadlineSignal(signal, REQUEST_TIMEOUT_MS);
-    try {
-      const response = await fetchWithResilience(process.env.JEV_API_BASE_URL!, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.JEV_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ model, state, questions }),
-      }, deadline);
-      const bodyText = await readBodyBounded(response, deadline);
-      if (!response.ok) {
-        // Client-visible errors stay fixed-string: provider name and numeric
-        // status only — a reflecting proxy can echo nothing back through them.
-        throw new Error(`Jev-compatible endpoint ${response.status}`);
-      }
-      let body: unknown;
-      try {
-        body = JSON.parse(bodyText);
-      } catch {
-        body = null; // parse failures never retry; surface as invalid response
-      }
-        const invalid = (why: string) => new Error(`Jev-compatible endpoint returned an invalid response: ${why}`);
-        if (!isRecord(body)) throw invalid("expected a JSON object.");
-        if (!isRecord(body.answers)) throw invalid("expected an answers object.");
-        // Envelope shape is validated here; per-question answer validity is the
-        // tools' job. Each tool fails closed under its invalid_response contract,
-        // so a missing or malformed answer can never reach tool-level defaults.
-        let inputTokens = 0;
-        let outputTokens = 0;
-        if (body.usage !== undefined && body.usage !== null) {
-      const tokenCount = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
-      if (!isRecord(body.usage) || !tokenCount(body.usage.input_tokens) || !tokenCount(body.usage.output_tokens)) {
-        throw invalid("usage must report finite non-negative input_tokens and output_tokens.");
-      }
-      inputTokens = body.usage.input_tokens;
-      outputTokens = body.usage.output_tokens;
-        }
-        if (body.model !== undefined && body.model !== null && typeof body.model !== "string") {
-      throw invalid("model must be absent or a string.");
-        }
-      return {
-        answers: body.answers,
-        usage: { input_tokens: inputTokens, output_tokens: outputTokens },
-        provider,
-        model: typeof body.model === "string" ? body.model : model,
-      };
-    } finally {
-      deadline.dispose();
-    }
+    return askSystemOne(process.env.JEV_API_BASE_URL!, process.env.JEV_API_KEY!, "Jev-compatible endpoint", provider,
+      model, state, questions, signal);
   }
 
   // Cloudflare Workers AI wraps the same contract in {model, input} and the
